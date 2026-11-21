@@ -16,6 +16,7 @@ jobs:
         run: |
           python tests_core.py
           python tests_features.py
+          python tests_update.py
           python tests_gui_smoke.py
       - name: Build exe (PyInstaller, onedir = fast start)
         run: |
