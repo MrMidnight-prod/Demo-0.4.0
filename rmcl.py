@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """rmcl - minimal Minecraft Java launcher with a tkinter GUI (standard library only)."""
-import hashlib, json, os, platform, queue, re, shutil, subprocess, sys, threading, traceback, uuid, zipfile
-import urllib.parse, urllib.request
+import base64, hashlib, json, os, platform, queue, re, shutil, struct, subprocess, sys, threading, traceback, uuid, zipfile
+import urllib.error, urllib.parse, urllib.request
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -310,14 +310,139 @@ def installer_version_id(jar):
         return json.loads(z.read("install_profile.json"))["versionInfo"]["id"]
 
 
-def mr_search(query, mc, loader):
+def mr_search(query, mc, loader, offset=0, limit=40):
+    """Modrinth search -> list of dicts. An empty query returns the most downloaded mods (browsable catalogue)."""
     facets = [["project_type:mod"]]
     if mc:
         facets.append([f"versions:{mc}"])
     if MR_LOADERS.get(loader):
         facets.append([f"categories:{l}" for l in MR_LOADERS[loader]])
-    q = urllib.parse.urlencode({"query": query, "facets": json.dumps(facets), "limit": 30})
-    return [(h["slug"], h["title"], h.get("description", "")) for h in get_json(f"https://api.modrinth.com/v2/search?{q}")["hits"]]
+    q = urllib.parse.urlencode({"query": query, "facets": json.dumps(facets), "limit": limit, "offset": offset,
+                                "index": "relevance" if query else "downloads"})
+    return [{"slug": h["slug"], "title": h["title"], "desc": h.get("description", ""),
+             "downloads": h.get("downloads", 0), "author": h.get("author", "")}
+            for h in get_json(f"https://api.modrinth.com/v2/search?{q}")["hits"]]
+
+
+def fmt_num(n):
+    return f"{n / 1e6:.1f}M" if n >= 1e6 else f"{n / 1e3:.0f}K" if n >= 1e3 else str(n)
+
+
+# ---------------------------------------------------------------- skins
+SKIN_NAMES = ["alex", "ari", "efe", "kai", "makena", "noor", "steve", "sunny", "zuri"]
+SKIN_PACK = "rmcl-skin.zip"
+
+
+def png_size(data):
+    if data[:8] != b"\x89PNG\r\n\x1a\n" or data[12:16] != b"IHDR":
+        raise ValueError("Это не PNG-файл")
+    return struct.unpack(">II", data[16:24])
+
+
+def validate_skin(data):
+    w, h = png_size(data)
+    if w == h and w % 64 == 0 and w <= 1024:
+        return w, h
+    if (w, h) in ((64, 32), (128, 64)):
+        raise ValueError("Старый формат скина 64×32 не поддерживается, нужен 64×64")
+    raise ValueError(f"Неверный размер {w}×{h}: нужен скин 64×64")
+
+
+def pack_format(mc):
+    try:
+        v = tuple(int(x) for x in mc.split(".")[:3])
+    except ValueError:
+        return 64
+    v += (0,) * (3 - len(v))
+    table = [((1, 21, 5), 55), ((1, 21, 4), 46), ((1, 21, 2), 42), ((1, 21, 0), 34), ((1, 20, 5), 32),
+             ((1, 20, 3), 22), ((1, 20, 2), 18), ((1, 20, 0), 15), ((1, 19, 4), 13), ((1, 19, 3), 12),
+             ((1, 19, 0), 9), ((1, 18, 0), 8), ((1, 17, 0), 7), ((1, 16, 2), 6), ((1, 15, 0), 5),
+             ((1, 13, 0), 4), ((1, 11, 0), 3), ((1, 9, 0), 2)]
+    return next((f for ver, f in table if v >= ver), 1)
+
+
+def build_skin_pack(png, mc, dest):
+    """Resource pack that replaces every default player skin with `png` (works in any version / loader)."""
+    validate_skin(png)
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(dest.name + ".part")
+    meta = {"pack": {"pack_format": pack_format(mc), "description": "rmcl: свой скин",
+                     "supported_formats": {"min_inclusive": 1, "max_inclusive": 9999}}}
+    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("pack.mcmeta", json.dumps(meta, ensure_ascii=False))
+        for n in SKIN_NAMES:
+            for kind in ("slim", "wide"):  # 1.19.3+
+                z.writestr(f"assets/minecraft/textures/entity/player/{kind}/{n}.png", png)
+        for n in ("steve", "alex"):  # older versions
+            z.writestr(f"assets/minecraft/textures/entity/{n}.png", png)
+    tmp.replace(dest)
+
+
+def _opt_list(lines, key):
+    for i, l in enumerate(lines):
+        if l.startswith(key + ":"):
+            try:
+                return i, list(json.loads(l[len(key) + 1:]))
+            except Exception:
+                return i, []
+    return None, []
+
+
+def set_pack_in_options(path, pack_id, enabled):
+    """Add/remove a resource pack in options.txt. It is also put in incompatibleResourcePacks, otherwise
+    the game silently drops packs whose pack_format it does not recognise."""
+    path = Path(path)
+    lines = path.read_text("utf-8").splitlines() if path.exists() else []
+    before = list(lines)
+    for key in ("resourcePacks", "incompatibleResourcePacks"):
+        i, lst = _opt_list(lines, key)
+        if i is None and not enabled:
+            continue
+        if key == "resourcePacks" and i is None:
+            lst = ["vanilla"]
+        lst = [x for x in lst if x != pack_id] + ([pack_id] if enabled else [])
+        line = f"{key}:{json.dumps(lst, separators=(',', ':'))}"
+        if i is None:
+            lines.append(line)
+        else:
+            lines[i] = line
+    if lines != before:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(lines) + "\n", "utf-8")
+
+
+def fetch_skin_by_name(name):
+    """Public skin of a real Mojang account -> (png bytes, 'slim'|'wide')."""
+    name = name.strip()
+    if not re.fullmatch(r"\w{1,16}", name):
+        raise ValueError("Некорректный ник (до 16 символов: буквы, цифры, _)")
+    try:
+        prof = get_json(f"https://api.mojang.com/users/profiles/minecraft/{urllib.parse.quote(name)}")
+        sess = get_json(f"https://sessionserver.mojang.com/session/minecraft/profile/{prof['id']}")
+    except urllib.error.HTTPError as e:
+        raise RuntimeError("Mojang ограничил запросы, попробуйте позже" if e.code == 429 else f"Игрок «{name}» не найден")
+    except (ValueError, KeyError):
+        raise RuntimeError(f"Игрок «{name}» не найден")
+    except Exception:
+        raise RuntimeError("Нет связи с серверами Mojang")
+    tex = next((p for p in sess.get("properties", []) if p.get("name") == "textures"), None)
+    skin = (json.loads(base64.b64decode(tex["value"])).get("textures", {}).get("SKIN")) if tex else None
+    if not skin:
+        raise RuntimeError(f"У игрока «{name}» нет собственного скина")
+    model = "slim" if (skin.get("metadata") or {}).get("model") == "slim" else "wide"
+    return http_get(skin["url"].replace("http://", "https://", 1)), model
+
+
+def preview_parts(slim):
+    """Front view of a 64x64 skin: (src box, dst x/y in skin pixels, is_overlay). Canvas is 16x32 skin pixels."""
+    aw = 3 if slim else 4
+    return [((8, 8, 16, 16), (4, 0), False), ((40, 8, 48, 16), (4, 0), True),
+            ((20, 20, 28, 32), (4, 8), False), ((20, 36, 28, 48), (4, 8), True),
+            ((44, 20, 44 + aw, 32), (4 - aw, 8), False), ((44, 36, 44 + aw, 48), (4 - aw, 8), True),
+            ((36, 52, 36 + aw, 64), (12, 8), False), ((52, 52, 52 + aw, 64), (12, 8), True),
+            ((4, 20, 8, 32), (4, 20), False), ((4, 36, 8, 48), (4, 20), True),
+            ((20, 52, 24, 64), (8, 20), False), ((4, 52, 8, 64), (8, 20), True)]
 
 
 def pick_neoforge(mc):
@@ -689,6 +814,17 @@ class Core:
         if not opt.exists():
             opt.write_text(TIERS[o["tier"]]["options"])
             self.log(f"Записаны настройки графики для профиля «{TIERS[o['tier']]['label']}»")
+        sk, pack = o.get("skin"), o["game_dir"] / "resourcepacks" / SKIN_PACK
+        try:
+            if sk and Path(sk["png"]).exists():
+                build_skin_pack(Path(sk["png"]).read_bytes(), o.get("mc") or prof.get("inheritsFrom") or prof["id"], pack)
+                set_pack_in_options(opt, "file/" + SKIN_PACK, True)
+                self.log("Скин применён (пакет ресурсов rmcl-skin.zip)")
+            elif pack.exists():
+                set_pack_in_options(opt, "file/" + SKIN_PACK, False)
+                pack.unlink()
+        except ValueError as e:
+            self.log(f"Скин не применён: {e}")
         self.log(f"Launching {prof['id']} as {o['name']} ({o['game_dir']})")
         self.proc = subprocess.Popen([java] + args, cwd=o["game_dir"], stdout=subprocess.PIPE,
                                      stderr=subprocess.STDOUT, creationflags=NO_WINDOW)
@@ -837,7 +973,8 @@ def main():
     except Exception:
         st = {}
     q, cancel = queue.Queue(), threading.Event()
-    state = {"core": None, "busy": False, "hw": None, "hits": []}
+    state = {"core": None, "busy": False, "hw": None, "hits": [], "page": "play", "dirty": True, "sid": 0,
+             "st": None, "more": False}
     mods_by_loader = st.get("mods", {})
     inst_info = st.get("inst_info", {})
 
@@ -853,6 +990,10 @@ def main():
     v_mods_on = tk.BooleanVar(value=st.get("mods_on", True))
     v_dry = tk.BooleanVar(value=False)
     v_search = tk.StringVar(value="")
+    v_skin_on = tk.BooleanVar(value=st.get("skin_on", False))
+    v_skin_model = tk.StringVar(value=st.get("skin_model", "wide"))
+    v_skin_nick = tk.StringVar(value="")
+    SKIN_PATH = ROOT / "skins" / "skin.png"
 
     def put(t):
         q.put(("log", t))
@@ -870,7 +1011,8 @@ def main():
                 "version": v_ver.get(), "name": v_name.get(), "loader": v_loader.get(), "tier": v_tier.get(),
                 "ram": int(v_ram.get()), "ram_auto": v_ram_auto.get(), "server": v_server.get(),
                 "java": v_java.get(), "inst": v_inst.get(), "mods_on": v_mods_on.get(),
-                "mods": mods_by_loader, "inst_info": inst_info}), "utf-8")
+                "mods": mods_by_loader, "inst_info": inst_info, "skin_on": v_skin_on.get(),
+                "skin_model": v_skin_model.get()}), "utf-8")
         except Exception:
             pass
 
@@ -887,11 +1029,15 @@ def main():
     pages, navs = {}, {}
 
     def show(name):
+        state["page"] = name
         pages[name].tkraise()
         for n, lbl in navs.items():
             lbl.config(bg=CARD if n == name else SIDE, fg=ACCENT if n == name else FG)
+        if name == "mods" and (state["dirty"] or not state["hits"]):
+            state["dirty"] = False
+            schedule_search(50)
 
-    for key, text in (("play", "Играть"), ("mods", "Моды"), ("hw", "Железо"), ("log", "Журнал")):
+    for key, text in (("play", "Играть"), ("mods", "Моды"), ("skin", "Скин"), ("hw", "Железо"), ("log", "Журнал")):
         lbl = tk.Label(side, text="   " + text, bg=SIDE, fg=FG, font=(fam, 11, "bold"), anchor="w", pady=11,
                        cursor="hand2")
         lbl.pack(fill="x")
@@ -929,6 +1075,7 @@ def main():
         loader_note.config(text=LOADER_NOTES.get(v_loader.get(), ""))
         refresh_mods()
         refresh()
+        schedule_search(150)
 
     Seg(g, [(l.lower(), l) for l in LOADERS], v_loader, on_loader).grid(row=3, column=0, columnspan=2, sticky="w")
     loader_note.grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
@@ -954,7 +1101,7 @@ def main():
     play_chip = tk.Label(pp, text="", bg=BG, fg=MUTED, font=F, anchor="w", justify="left")
     play_chip.pack(fill="x", padx=30, pady=(18, 0))
 
-    # ================================================================ MODS page
+    # ================================================================ MODS page (live Modrinth search)
     mp = pages["mods"]
     mods_sub = header(mp, "Моды", "")
     body = tk.Frame(mp, bg=BG)
@@ -963,18 +1110,24 @@ def main():
     body.columnconfigure(1, weight=1, uniform="m")
     body.rowconfigure(0, weight=1)
 
-    c_s, s_in = card(body, "ПОИСК НА MODRINTH")
+    c_s, s_in = card(body, "MODRINTH  ·  ПОИСК В РЕАЛЬНОМ ВРЕМЕНИ")
     c_s.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-    srow = tk.Frame(s_in, bg=CARD)
-    srow.pack(fill="x")
-    e_search = ent(srow, v_search)
-    e_search.pack(side="left", fill="x", expand=True, ipady=6)
-    b_search = Btn(srow, "Найти")
-    b_search.pack(side="left", padx=(8, 0))
+    e_search = ent(s_in, v_search)
+    e_search.pack(fill="x", ipady=6)
+    search_lbl = tk.Label(s_in, text="Начните вводить название мода", bg=CARD, fg=MUTED, font=(fam, 9), anchor="w")
+    search_lbl.pack(fill="x", pady=(6, 0))
     lb_hits = listbox(s_in)
-    lb_hits.pack(fill="both", expand=True, pady=10)
-    b_add = Btn(s_in, "Добавить в сборку  →", kind="primary")
-    b_add.pack(anchor="e")
+    lb_hits.pack(fill="both", expand=True, pady=6)
+    detail = tk.Label(s_in, text="", bg=CARD, fg=MUTED, font=(fam, 9), anchor="w", justify="left",
+                      wraplength=330, height=4)
+    detail.pack(fill="x")
+    arow = tk.Frame(s_in, bg=CARD)
+    arow.pack(fill="x", pady=(6, 0))
+    b_more = Btn(arow, "Показать ещё")
+    b_more.pack(side="left")
+    b_more.set_enabled(False)
+    b_add = Btn(arow, "Добавить  →", kind="primary")
+    b_add.pack(side="right")
 
     c_b, b_in = card(body, "СБОРКА МОДОВ")
     c_b.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
@@ -1001,6 +1154,15 @@ def main():
             mods_by_loader[ld] = preset_mods(ld, effective()[0])
         return mods_by_loader[ld]
 
+    def render_hits():
+        sel = lb_hits.curselection()
+        lb_hits.delete(0, "end")
+        mods = get_mods()
+        for h in state["hits"]:
+            lb_hits.insert("end", ("✓  " if h["slug"] in mods else "      ") + f"{h['title']}   ·   {fmt_num(h['downloads'])}")
+        if sel and sel[0] < len(state["hits"]):
+            lb_hits.selection_set(sel[0])
+
     def refresh_mods():
         lb_mods.delete(0, "end")
         for m in get_mods():
@@ -1008,23 +1170,51 @@ def main():
         ld = v_loader.get()
         mods_sub.config(text="Для чистой игры моды не нужны." if ld == "vanilla"
                         else f"Сборка для {dict((l.lower(), l) for l in LOADERS)[ld]} · Minecraft {v_ver.get()}")
+        render_hits()
 
-    def do_search():
-        qs, ld, ver = v_search.get().strip(), v_loader.get(), v_ver.get().strip()
-        if not qs or ld == "vanilla":
+    def show_detail():
+        sel = lb_hits.curselection()
+        if sel and sel[0] < len(state["hits"]):
+            h = state["hits"][sel[0]]
+            detail.config(text=f"{h['title']} — {h['author']}\n{h['desc']}\nЗагрузок: {fmt_num(h['downloads'])}")
+
+    def schedule_search(delay=350):
+        """Debounced live search: every keystroke restarts the timer, stale answers are dropped by `sid`."""
+        if state["page"] != "mods":
+            state["dirty"] = True
             return
+        if state["st"] is not None:
+            try:
+                root.after_cancel(state["st"])
+            except Exception:
+                pass
+        state["st"] = root.after(delay, do_search)
+
+    def do_search(append=False):
+        state["st"] = None
+        ld, ver, qs = v_loader.get(), v_ver.get().strip(), v_search.get().strip()
+        if ld == "vanilla":
+            state["hits"] = []
+            render_hits()
+            search_lbl.config(text="Для чистой игры моды не нужны.")
+            return
+        if not append:
+            state["sid"] += 1
+        sid, off = state["sid"], (len(state["hits"]) if append else 0)
+        search_lbl.config(text="Поиск…")
 
         def run():
             try:
-                q.put(("hits", mr_search(qs, Core(put, cancel).resolve(ver), ld)))
+                mc = Core(put, cancel).resolve(ver)
+                q.put(("hits", sid, mr_search(qs, mc, ld, offset=off), append))
             except Exception as e:
-                put(f"Поиск не удался: {e}")
+                q.put(("hitserr", sid, str(e)))
         threading.Thread(target=run, daemon=True).start()
 
     def add_selected():
         sel = lb_hits.curselection()
         if sel and sel[0] < len(state["hits"]) and v_loader.get() != "vanilla":
-            slug = state["hits"][sel[0]][0]
+            slug = state["hits"][sel[0]]["slug"]
             mods = get_mods()
             if slug not in mods:
                 mods.append(slug)
@@ -1051,10 +1241,125 @@ def main():
         if path:
             start("mrpack", path)
 
-    b_search.config(); b_search._cmd = do_search
+    b_more._cmd = lambda: do_search(True)
     b_add._cmd, b_remove._cmd, b_preset._cmd, b_clear._cmd, b_pack._cmd = \
         add_selected, remove_selected, preset_click, clear_click, pack_click
-    e_search.bind("<Return>", lambda e: do_search())
+    lb_hits.bind("<<ListboxSelect>>", lambda e: show_detail())
+    lb_hits.bind("<Double-Button-1>", lambda e: add_selected())
+    v_search.trace_add("write", lambda *a: schedule_search())
+    v_ver.trace_add("write", lambda *a: schedule_search(700))
+
+    # ================================================================ SKIN page
+    kp = pages["skin"]
+    header(kp, "Скин", "Свой скин для офлайн-игры: выберите PNG-файл или скачайте публичный скин по нику.")
+    kbody = tk.Frame(kp, bg=BG)
+    kbody.pack(fill="both", expand=True, padx=30, pady=(0, 24))
+    kbody.columnconfigure(1, weight=1)
+    kbody.rowconfigure(0, weight=1)
+    c_pv, pv_in = card(kbody, "ПРЕДПРОСМОТР")
+    c_pv.grid(row=0, column=0, sticky="ns", padx=(0, 16))
+    prev_lbl = tk.Label(pv_in, text="нет скина", bg=CARD, fg=MUTED, font=F, padx=34, pady=70)
+    prev_lbl.pack(pady=6)
+    c_ks, ks_in = card(kbody, "ВАШ СКИН")
+    c_ks.grid(row=0, column=1, sticky="nsew")
+    skin_info = tk.Label(ks_in, text="", bg=CARD, fg=FG, font=F, anchor="w", justify="left")
+    skin_info.pack(fill="x")
+    krow = tk.Frame(ks_in, bg=CARD)
+    krow.pack(fill="x", pady=(12, 0))
+    b_skin_file = Btn(krow, "Выбрать файл (.png)…", kind="primary")
+    b_skin_file.pack(side="left")
+    b_skin_reset = Btn(krow, "Сбросить")
+    b_skin_reset.pack(side="left", padx=(10, 0))
+    tk.Label(ks_in, text="СКАЧАТЬ ПО НИКУ (ПУБЛИЧНЫЙ СКИН MOJANG)", bg=CARD, fg=MUTED, font=SM,
+             anchor="w").pack(fill="x", pady=(16, 4))
+    nrow = tk.Frame(ks_in, bg=CARD)
+    nrow.pack(fill="x")
+    ent(nrow, v_skin_nick).pack(side="left", fill="x", expand=True, ipady=6)
+    b_skin_dl = Btn(nrow, "Скачать")
+    b_skin_dl.pack(side="left", padx=(8, 0))
+    tk.Label(ks_in, text="КАК НАРИСОВАН ВАШ СКИН", bg=CARD, fg=MUTED, font=SM, anchor="w").pack(fill="x", pady=(16, 4))
+    Seg(ks_in, [("wide", "Классический"), ("slim", "Тонкие руки")], v_skin_model, lambda: refresh_skin()).pack(anchor="w")
+    check(ks_in, "Применять скин при запуске игры", v_skin_on,
+          lambda: (settings_save(), refresh_skin())).pack(fill="x", pady=(14, 0))
+    skin_msg = tk.Label(ks_in, text="", bg=CARD, fg=MUTED, font=(fam, 9), anchor="w", justify="left", wraplength=430)
+    skin_msg.pack(fill="x", pady=(6, 0))
+    tk.Label(ks_in, text=("Скин накладывается пакетом ресурсов на скин по умолчанию, поэтому работает в любой версии "
+                          "и с любым загрузчиком, без модов. В офлайн-режиме его видите только вы. Если руки "
+                          "выглядят не так (толстые или тонкие), измените ник: модель выбирает игра по нику."),
+             bg=CARD, fg=MUTED, font=(fam, 9), anchor="w", justify="left", wraplength=430).pack(fill="x", pady=(10, 0))
+
+    def make_preview(path, slim, k=7):
+        src = tk.PhotoImage(file=str(path))
+        scale = max(1, src.width() // 64)
+        dst = tk.PhotoImage(width=16 * k, height=32 * k)
+        for box, (dx, dy), overlay in preview_parts(slim):
+            args = [dst.name, "copy", src.name, "-from", *[c * scale for c in box], "-to", dx * k, dy * k,
+                    "-zoom", k, "-subsample", scale]
+            if overlay:
+                args += ["-compositingrule", "overlay"]
+            dst.tk.call(*args)
+        return dst
+
+    def refresh_skin():
+        if not SKIN_PATH.exists():
+            skin_info.config(text="Скин не выбран. Используется стандартный.")
+            prev_lbl.config(image="", text="нет скина")
+            return
+        try:
+            w, h = png_size(SKIN_PATH.read_bytes())
+            skin_info.config(text=f"Размер: {w}×{h}\nСтатус: {'применяется при запуске' if v_skin_on.get() else 'выключен'}")
+            img = make_preview(SKIN_PATH, v_skin_model.get() == "slim")
+            prev_lbl.config(image=img, text="")
+            prev_lbl.image = img
+        except Exception as e:
+            prev_lbl.config(image="", text="предпросмотр\nнедоступен")
+            put(f"Предпросмотр скина: {e}")
+
+    def set_skin(data, model):
+        try:
+            validate_skin(data)
+            SKIN_PATH.parent.mkdir(parents=True, exist_ok=True)
+            SKIN_PATH.write_bytes(data)
+        except Exception as e:
+            skin_msg.config(text=f"Скин не установлен: {e}", fg=DANGER)
+            return
+        v_skin_model.set(model)
+        v_skin_on.set(True)
+        skin_msg.config(text="Скин установлен. Он появится при следующем запуске игры.", fg=ACCENT)
+        settings_save()
+        refresh_skin()
+
+    def skin_choose():
+        path = filedialog.askopenfilename(filetypes=[("PNG-скин", "*.png"), ("Все файлы", "*.*")])
+        if not path:
+            return
+        try:
+            data = Path(path).read_bytes()
+        except Exception as e:
+            skin_msg.config(text=f"Не удалось прочитать файл: {e}", fg=DANGER)
+            return
+        set_skin(data, v_skin_model.get())
+
+    def skin_download():
+        nick = v_skin_nick.get().strip()
+        skin_msg.config(text="Загружаю…", fg=MUTED)
+
+        def run():
+            try:
+                data, model = fetch_skin_by_name(nick)
+                q.put(("skin", data, model))
+            except Exception as e:
+                q.put(("skinerr", str(e)))
+        threading.Thread(target=run, daemon=True).start()
+
+    def skin_reset():
+        SKIN_PATH.unlink(missing_ok=True)
+        v_skin_on.set(False)
+        skin_msg.config(text="Скин сброшен.", fg=MUTED)
+        settings_save()
+        refresh_skin()
+
+    b_skin_file._cmd, b_skin_dl._cmd, b_skin_reset._cmd = skin_choose, skin_download, skin_reset
 
     # ================================================================ HARDWARE page
     hp = pages["hw"]
@@ -1185,7 +1490,8 @@ def main():
             if mode == "play":
                 core.launch(prof, jar, {"name": cfg["name"] or "Player", "server": cfg["server"].strip() or None,
                                         "ram": cfg["ram"], "java": java, "tier": cfg["tier"], "zgc": False,
-                                        "game_dir": game_dir, "hw": cfg["hw"]}, dry_run=cfg["dry"])
+                                        "game_dir": game_dir, "hw": cfg["hw"], "mc": mc,
+                                        "skin": {"png": SKIN_PATH} if cfg["skin"] else None}, dry_run=cfg["dry"])
             else:
                 put(f"Готово: {vid}")
         except Cancelled:
@@ -1206,7 +1512,8 @@ def main():
         cfg = {"version": v_ver.get().strip(), "name": v_name.get().strip(), "loader": v_loader.get(),
                "tier": tier, "ram": ram, "server": v_server.get(), "java": v_java.get(), "dry": v_dry.get(),
                "inst": v_inst.get().strip(), "inst_info": dict(inst_info), "mods_on": v_mods_on.get(),
-               "mods": list(get_mods()), "hw": state["hw"] or DEFAULT_HW, "pack": pack}
+               "mods": list(get_mods()), "hw": state["hw"] or DEFAULT_HW, "pack": pack,
+               "skin": bool(v_skin_on.get() and SKIN_PATH.exists())}
         threading.Thread(target=job, args=(mode, cfg), daemon=True).start()
 
     def stop():
@@ -1246,10 +1553,21 @@ def main():
                     refresh()
                     refresh_mods()
                 elif m[0] == "hits":
-                    state["hits"] = m[1]
-                    lb_hits.delete(0, "end")
-                    for slug, title, desc in m[1]:
-                        lb_hits.insert("end", f"{title}  ({slug})")
+                    if m[1] == state["sid"]:
+                        state["hits"] = (state["hits"] + m[2]) if m[3] else m[2]
+                        state["more"] = len(m[2]) >= 40
+                        render_hits()
+                        kind = "Найдено" if v_search.get().strip() else "Популярные моды"
+                        search_lbl.config(text=f"{kind}: {len(state['hits'])}" + ("+" if state["more"] else "")
+                                          if state["hits"] else "Ничего не найдено")
+                        b_more.set_enabled(state["more"])
+                elif m[0] == "hitserr":
+                    if m[1] == state["sid"]:
+                        search_lbl.config(text="Поиск не удался: " + m[2][:80])
+                elif m[0] == "skin":
+                    set_skin(m[1], m[2])
+                elif m[0] == "skinerr":
+                    skin_msg.config(text=m[1], fg=DANGER)
                 elif m[0] == "pack":
                     info = m[1]
                     if info.get("mc"):
@@ -1276,6 +1594,7 @@ def main():
     put(f"Данные: {ROOT}")
     put("Первый запуск долгий: скачиваются Java, игра и моды.")
     on_loader()
+    refresh_skin()
     show("play")
     threading.Thread(target=bg_hw, daemon=True).start()
     threading.Thread(target=bg_versions, daemon=True).start()

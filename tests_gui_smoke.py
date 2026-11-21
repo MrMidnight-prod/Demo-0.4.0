@@ -29,8 +29,21 @@ class Var:
 tk = types.ModuleType("tkinter")
 for n in ("Tk", "Frame", "Label", "Entry", "Checkbutton", "Listbox", "Scale", "Text"): setattr(tk, n, type(n, (W,), {}))
 tk.StringVar = tk.BooleanVar = tk.IntVar = Var
+CALLS = []
+class PI(W):  # PhotoImage stand-in: records the Tk "copy" calls used for the skin preview
+    name = "img1"
+    def __init__(self, *a, **k): super().__init__(*a, **k)
+    def width(self): return 64
+    tk = types.SimpleNamespace(call=lambda *a: CALLS.append(a))
+tk.PhotoImage = PI
 ttk = types.ModuleType("tkinter.ttk")
 for n in ("Style", "Combobox", "Progressbar", "Scrollbar"): setattr(ttk, n, type(n, (W,), {}))
+import struct, zlib
+def _png(w, h):
+    raw = b"".join(b"\x00" + b"\x00\x00\x00\xff" * w for _ in range(h))
+    ch = lambda t, d: struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xFFFFFFFF)
+    return b"\x89PNG\r\n\x1a\n" + ch(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0)) + ch(b"IDAT", zlib.compress(raw)) + ch(b"IEND", b"")
+(tmp / "x.mrpack").write_bytes(_png(64, 64))   # doubles as a valid skin for the "choose file" button
 fd = types.ModuleType("tkinter.filedialog"); fd.askopenfilename = lambda **k: str(tmp / "x.mrpack")
 fnt = types.ModuleType("tkinter.font"); fnt.families = lambda: ["Segoe UI"]
 tk.ttk, tk.filedialog, tk.font = ttk, fd, fnt
@@ -48,7 +61,7 @@ class FakeCore:  # no network, no processes
     def import_mrpack(self, p): return {"name": "P", "mc": "1.20.1", "loader": "forge", "lver": "47.3.0"}
 rmcl.Core = FakeCore
 rmcl.get_json = lambda url: {"versions": [{"id": "1.20.1", "type": "release"}]}
-rmcl.mr_search = lambda q, mc, ld: [("sodium", "Sodium", "fast")]
+rmcl.mr_search = lambda q, mc, ld, **k: [{"slug": "sodium", "title": "Sodium", "desc": "fast", "downloads": 123456, "author": "jelly"}]
 
 rmcl.subprocess.Popen = lambda *a, **k: None  # open_data(): no real xdg-open
 rmcl.main()
@@ -57,7 +70,15 @@ btns = [w for w in ALL if w.__dict__.get("_cmd")]
 assert len(btns) >= 8, len(btns)
 time.sleep(1.5)                     # let hardware / version threads post their messages
 for _ in range(3): AFTER[0]()       # poll: hw, versions, logs
+stored = False
 for b in btns:                      # press every button
     b._cmd(); time.sleep(0.15); AFTER[0]()
-time.sleep(0.5); AFTER[0]()
+    stored = stored or (tmp / 'skins' / 'skin.png').exists()   # 'Reset' button removes it later
+time.sleep(0.5)
+for fn in list(AFTER):             # also runs the debounced live-search callbacks scheduled by the UI
+    if fn: fn()
+time.sleep(0.5)
+for _ in range(3): AFTER[0]()
+assert stored, "skin file was never stored by the choose-file button"
+assert len(CALLS) >= 12 and all(c[1] == "copy" for c in CALLS), len(CALLS)
 print("GUI SMOKE OK; buttons pressed:", len(btns))
