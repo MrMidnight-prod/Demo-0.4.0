@@ -1,0 +1,51 @@
+name: build-windows
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [main]
+    tags: ["v*"]
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Tests
+        run: |
+          python tests_core.py
+          python tests_features.py
+          python tests_gui_smoke.py
+      - name: Build exe (PyInstaller, onedir = fast start)
+        run: |
+          pip install pyinstaller
+          pyinstaller --noconfirm --windowed --name rmcl rmcl.py
+
+      # Portable build is uploaded first, so you get a working program even if the installer step fails.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rmcl-portable
+          path: dist/rmcl
+
+      - name: Show build output
+        shell: pwsh
+        run: |
+          Get-Location
+          Get-ChildItem dist\rmcl | Select-Object -First 8 Name
+          Get-ChildItem installer
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $iscc = (Get-ChildItem "C:\Program Files*\Inno Setup 6\ISCC.exe" -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
+          if (-not $iscc) { $iscc = (Get-Command ISCC.exe -ErrorAction Stop).Source }
+          Write-Host "ISCC: $iscc"
+          New-Item -ItemType Directory -Force installer\output | Out-Null
+          & $iscc "/DAppDir=$PWD\dist\rmcl" "/DOutDir=$PWD\installer\output" "$PWD\installer\rmcl.iss"
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rmcl-setup
+          path: installer/output/rmcl-setup.exe
