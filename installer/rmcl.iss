@@ -18,7 +18,7 @@ SolidCompression=yes
 PrivilegesRequired=lowest
 
 [Tasks]
-Name: "desktopicon"; Description: "Создать ярлык на рабочем столе"
+Name: "desktopicon"; Description: "РЎРѕР·РґР°С‚СЊ СЏСЂР»С‹Рє РЅР° СЂР°Р±РѕС‡РµРј СЃС‚РѕР»Рµ"
 
 [Files]
 Source: "{#AppDir}\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs
@@ -28,4 +28,4 @@ Name: "{group}\rmcl"; Filename: "{app}\rmcl.exe"
 Name: "{autodesktop}\rmcl"; Filename: "{app}\rmcl.exe"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\rmcl.exe"; Description: "Запустить rmcl"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\rmcl.exe"; Description: "Р—Р°РїСѓСЃС‚РёС‚СЊ rmcl"; Flags: nowait postinstall skipifsilent
